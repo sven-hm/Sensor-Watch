@@ -52,7 +52,7 @@
 
 #include "movement.h"
 
-#define COUNTDOWN_SLOTS 3
+#define COUNTDOWN_SLOTS 5
 
 typedef enum {
     cd_paused,
