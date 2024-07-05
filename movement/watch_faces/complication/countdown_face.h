@@ -26,15 +26,23 @@
 #define COUNTDOWN_FACE_H_
 
 /*
- * COUNTDOWN TIMER face
+ * COUNTDOWN TIMER face with 3 countdown slots
  *
  * Slight extension of the original countdown face by Wesley Ellis.
- *   - Press the light button to enter setting mode and adjust the
- *     countdown timer.
+ *
+ * Usage:
+ *   - Press the light button to cycle through the timer slots
+ *   - Long press the light button to enter setting mode for the current slot:
+ *     - Press the light button to cycle through settings
+ *       (hour -> minute -> second -> finish settings)
+ *     - Long press the light button to reset current value to zero
+ *     - Press the alarm button to adjust the current value
  *   - Start and pause the countdown using the alarm button, similar
  *     to the stopwatch face.
- *   - When paused or terminated, press the light button to restore the
+ *   - When paused, long press the light button to restore the
  *     last entered countdown.
+ *   - When one of the countdown timers finishes the watch jumps to the
+ *     according slot in the countdown timer face.
  *
  * Max countdown is 23 hours, 59 minutes and 59 seconds.
  *
@@ -43,6 +51,8 @@
  */
 
 #include "movement.h"
+
+#define COUNTDOWN_SLOTS 3
 
 typedef enum {
     cd_paused,
@@ -53,17 +63,23 @@ typedef enum {
 
 typedef struct {
     uint32_t target_ts;
-    uint32_t now_ts;
-    uint8_t hours;
-    uint8_t minutes;
-    uint8_t seconds;
-    uint8_t set_hours;
-    uint8_t set_minutes;
-    uint8_t set_seconds;
-    uint8_t selection;
+    uint8_t hours : 5;
+    uint8_t minutes : 6;
+    uint8_t seconds : 6;
+    uint8_t set_hours : 5;
+    uint8_t set_minutes : 6;
+    uint8_t set_seconds : 6;
     countdown_mode_t mode;
-} countdown_state_t;
+} countdown_slot_state_t;
 
+typedef struct {
+    uint32_t now_ts;
+    uint8_t selection : 2;
+    uint8_t current_slot_idx : 6;
+    uint8_t next_alarm_slot_idx : 6;
+    uint8_t watch_face_idx;
+    countdown_slot_state_t slots[COUNTDOWN_SLOTS];
+} countdown_state_t;
 
 void countdown_face_setup(movement_settings_t *settings, uint8_t watch_face_index, void ** context_ptr);
 void countdown_face_activate(movement_settings_t *settings, void *context);

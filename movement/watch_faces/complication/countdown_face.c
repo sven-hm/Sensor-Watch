@@ -37,7 +37,7 @@ static bool quick_ticks_running;
 static void abort_quick_ticks(countdown_state_t *state) {
     if (quick_ticks_running) {
         quick_ticks_running = false;
-        if (state->mode == cd_setting)
+        if (state->slots[state->current_slot_idx].mode == cd_setting)
             movement_request_tick_frequency(4);
         else
             movement_request_tick_frequency(1);
@@ -49,17 +49,21 @@ static inline int32_t get_tz_offset(movement_settings_t *settings) {
 }
 
 static inline void store_countdown(countdown_state_t *state) {
-    /* Store set countdown time */
-    state->set_hours = state->hours;
-    state->set_minutes = state->minutes;
-    state->set_seconds = state->seconds;
+    // Store set_{hours,minutes,seconds}
+    countdown_slot_state_t* slot_state = &state->slots[state->current_slot_idx];
+
+    slot_state->set_hours = slot_state->hours;
+    slot_state->set_minutes = slot_state->minutes;
+    slot_state->set_seconds = slot_state->seconds;
 }
 
 static inline void load_countdown(countdown_state_t *state) {
     /* Load set countdown time */
-    state->hours = state->set_hours;
-    state->minutes = state->set_minutes;
-    state->seconds = state->set_seconds;
+    countdown_slot_state_t* slot_state = &state->slots[state->current_slot_idx];
+
+    slot_state->hours = slot_state->set_hours;
+    slot_state->minutes = slot_state->set_minutes;
+    slot_state->seconds = slot_state->set_seconds;
 }
 
 static inline void button_beep(movement_settings_t *settings) {
@@ -68,15 +72,38 @@ static inline void button_beep(movement_settings_t *settings) {
         watch_buzzer_play_note(BUZZER_NOTE_C7, 50);
 }
 
+static void update_next_alarm(countdown_state_t *state, movement_settings_t *settings) {
+    uint32_t next_alarm = UINT32_MAX;
+
+    // pick next ts from running slots
+    for (uint8_t ii = 0; ii < COUNTDOWN_SLOTS; ii++) {
+        countdown_slot_state_t* current_slot_state = &state->slots[ii];
+        if (current_slot_state->mode == cd_running) {
+            if (current_slot_state->target_ts < next_alarm) {
+                next_alarm = current_slot_state->target_ts;
+                state->next_alarm_slot_idx = ii;
+            }
+        }
+    }
+
+    if (next_alarm == UINT32_MAX) {
+        movement_cancel_background_task_for_face(state->watch_face_idx);
+    } else {
+        watch_date_time target_dt = watch_utility_date_time_from_unix_time(
+                next_alarm, get_tz_offset(settings));
+        movement_schedule_background_task_for_face(state->watch_face_idx, target_dt);
+    }
+}
+
 static void start(countdown_state_t *state, movement_settings_t *settings) {
     watch_date_time now = watch_rtc_get_date_time();
+    countdown_slot_state_t* current_slot_state = &state->slots[state->current_slot_idx];
 
-    state->mode = cd_running;
+    current_slot_state->mode = cd_running;
     state->now_ts = watch_utility_date_time_to_unix_time(now, get_tz_offset(settings));
-    state->target_ts = watch_utility_offset_timestamp(state->now_ts, state->hours, state->minutes, state->seconds);
-    watch_date_time target_dt = watch_utility_date_time_from_unix_time(state->target_ts, get_tz_offset(settings));
-    movement_schedule_background_task(target_dt);
-    watch_set_indicator(WATCH_INDICATOR_BELL);
+    current_slot_state->target_ts = watch_utility_offset_timestamp(
+            state->now_ts, current_slot_state->hours, current_slot_state->minutes, current_slot_state->seconds);
+    update_next_alarm(state, settings);
 }
 
 static void draw(countdown_state_t *state, uint8_t subsecond) {
@@ -85,22 +112,36 @@ static void draw(countdown_state_t *state, uint8_t subsecond) {
     uint32_t delta;
     div_t result;
 
-    switch (state->mode) {
+    countdown_slot_state_t* current_slot_state = &state->slots[state->current_slot_idx];
+
+    switch (current_slot_state->mode) {
         case cd_running:
-            delta = state->target_ts - state->now_ts;
+            delta = current_slot_state->target_ts - state->now_ts;
             result = div(delta, 60);
-            state->seconds = result.rem;
+            current_slot_state->seconds = result.rem;
             result = div(result.quot, 60);
-            state->hours = result.quot;
-            state->minutes = result.rem;
-            sprintf(buf, "CD  %2d%02d%02d", state->hours, state->minutes, state->seconds);
+            current_slot_state->hours = result.quot;
+            current_slot_state->minutes = result.rem;
+            sprintf(buf, "CD%2d%2d%02d%02d",
+                    state->current_slot_idx + 1,
+                    current_slot_state->hours,
+                    current_slot_state->minutes,
+                    current_slot_state->seconds);
             break;
         case cd_reset:
         case cd_paused:
-            sprintf(buf, "CD  %2d%02d%02d", state->hours, state->minutes, state->seconds);
+            sprintf(buf, "CD%2d%2d%02d%02d",
+                    state->current_slot_idx + 1,
+                    current_slot_state->hours,
+                    current_slot_state->minutes,
+                    current_slot_state->seconds);
             break;
         case cd_setting:
-            sprintf(buf, "CD  %2d%02d%02d", state->hours, state->minutes, state->seconds);
+            sprintf(buf, "CD%2d%2d%02d%02d",
+                    state->current_slot_idx + 1,
+                    current_slot_state->hours,
+                    current_slot_state->minutes,
+                    current_slot_state->seconds);
             if (!quick_ticks_running && subsecond % 2) {
                 switch(state->selection) {
                     case 0:
@@ -118,37 +159,45 @@ static void draw(countdown_state_t *state, uint8_t subsecond) {
             }
             break;
     }
+    if (current_slot_state->mode == cd_running) {
+        watch_set_indicator(WATCH_INDICATOR_BELL);
+    } else {
+        watch_clear_indicator(WATCH_INDICATOR_BELL);
+    }
     watch_display_string(buf, 0);
 }
 
-static void pause(countdown_state_t *state) {
-    state->mode = cd_paused;
-    movement_cancel_background_task();
+static void pause(countdown_state_t *state, movement_settings_t *settings) {
+    state->slots[state->current_slot_idx].mode = cd_paused;
+    update_next_alarm(state, settings);
     watch_clear_indicator(WATCH_INDICATOR_BELL);
 }
 
-static void reset(countdown_state_t *state) {
-    state->mode = cd_reset;
-    movement_cancel_background_task();
+static void reset(countdown_state_t *state, movement_settings_t *settings) {
+    state->slots[state->current_slot_idx].mode = cd_reset;
+    update_next_alarm(state, settings);
     watch_clear_indicator(WATCH_INDICATOR_BELL);
     load_countdown(state);
 }
 
-static void ring(countdown_state_t *state) {
+static void ring(countdown_state_t *state, movement_settings_t *settings) {
+    state->current_slot_idx = state->next_alarm_slot_idx;
+    reset(state, settings);
     movement_play_alarm();
-    reset(state);
 }
 
 static void settings_increment(countdown_state_t *state) {
+    countdown_slot_state_t* current_slot_state = &state->slots[state->current_slot_idx];
+
     switch(state->selection) {
         case 0:
-            state->hours = (state->hours + 1) % 24;
+            current_slot_state->hours = (current_slot_state->hours + 1) % 24;
             break;
         case 1:
-            state->minutes = (state->minutes + 1) % 60;
+            current_slot_state->minutes = (current_slot_state->minutes + 1) % 60;
             break;
         case 2:
-            state->seconds = (state->seconds + 1) % 60;
+            current_slot_state->seconds = (current_slot_state->seconds + 1) % 60;
             break;
         default:
             // should never happen
@@ -159,14 +208,17 @@ static void settings_increment(countdown_state_t *state) {
 
 void countdown_face_setup(movement_settings_t *settings, uint8_t watch_face_index, void ** context_ptr) {
     (void) settings;
-    (void) watch_face_index;
 
     if (*context_ptr == NULL) {
         *context_ptr = malloc(sizeof(countdown_state_t));
         countdown_state_t *state = (countdown_state_t *)*context_ptr;
         memset(*context_ptr, 0, sizeof(countdown_state_t));
-        state->minutes = DEFAULT_MINUTES;
-        state->mode = cd_reset;
+        state->current_slot_idx = 0;
+        state->next_alarm_slot_idx = COUNTDOWN_SLOTS;
+        state->watch_face_idx = watch_face_index;
+        for (uint8_t ii = 0; ii < COUNTDOWN_SLOTS; ii++) {
+            state->slots[ii].mode = cd_reset;
+        }
         store_countdown(state);
     }
 }
@@ -174,10 +226,14 @@ void countdown_face_setup(movement_settings_t *settings, uint8_t watch_face_inde
 void countdown_face_activate(movement_settings_t *settings, void *context) {
     (void) settings;
     countdown_state_t *state = (countdown_state_t *)context;
-    if(state->mode == cd_running) {
-        watch_date_time now = watch_rtc_get_date_time();
-        state->now_ts = watch_utility_date_time_to_unix_time(now, get_tz_offset(settings));
-        watch_set_indicator(WATCH_INDICATOR_BELL);
+
+    for (uint8_t ii = 0; ii < COUNTDOWN_SLOTS; ii++) {
+        // update state->now_ts if at least one slot is running
+        if (state->slots[ii].mode == cd_running) {
+            watch_date_time now = watch_rtc_get_date_time();
+            state->now_ts = watch_utility_date_time_to_unix_time(now, get_tz_offset(settings));
+            break;
+        }
     }
     watch_set_colon();
 
@@ -186,8 +242,8 @@ void countdown_face_activate(movement_settings_t *settings, void *context) {
 }
 
 bool countdown_face_loop(movement_event_t event, movement_settings_t *settings, void *context) {
-    (void) settings;
     countdown_state_t *state = (countdown_state_t *)context;
+    countdown_slot_state_t* current_slot_state = &state->slots[state->current_slot_idx];
 
     switch (event.event_type) {
         case EVENT_ACTIVATE:
@@ -201,8 +257,11 @@ bool countdown_face_loop(movement_event_t event, movement_settings_t *settings, 
                     abort_quick_ticks(state);
             }
 
-            if (state->mode == cd_running) {
-                state->now_ts++;
+            for (uint8_t ii = 0; ii < COUNTDOWN_SLOTS; ii++) {
+                if (state->slots[ii].mode == cd_running) {
+                    state->now_ts++;
+                    break;
+                }
             }
             draw(state, event.subsecond);
             break;
@@ -211,41 +270,31 @@ bool countdown_face_loop(movement_event_t event, movement_settings_t *settings, 
             movement_move_to_next_face();
             break;
         case EVENT_LIGHT_BUTTON_UP:
-            switch(state->mode) {
-                case cd_running:
-                    movement_illuminate_led();
-                    break;
-                case cd_paused:
-                    reset(state);
+            if (current_slot_state->mode == cd_setting) {
+                state->selection++;
+                if(state->selection >= CD_SELECTIONS) {
+                    state->selection = 0;
+                    current_slot_state->mode = cd_reset;
+                    store_countdown(state);
+                    movement_request_tick_frequency(1);
                     button_beep(settings);
-                    break;
-                case cd_reset:
-                    state->mode = cd_setting;
-                    movement_request_tick_frequency(4);
-                    button_beep(settings);
-                    break;
-                case cd_setting:
-                    state->selection++;
-                    if(state->selection >= CD_SELECTIONS) {
-                        state->selection = 0;
-                        state->mode = cd_reset;
-                        store_countdown(state);
-                        movement_request_tick_frequency(1);
-                        button_beep(settings);
-                    }
-                    break;
+                }
+            } else {
+                state->current_slot_idx = (state->current_slot_idx + 1) % COUNTDOWN_SLOTS;
             }
             draw(state, event.subsecond);
             break;
         case EVENT_ALARM_BUTTON_UP:
-            switch(state->mode) {
+            switch(current_slot_state->mode) {
                 case cd_running:
-                    pause(state);
+                    pause(state, settings);
                     button_beep(settings);
                     break;
                 case cd_reset:
                 case cd_paused:
-                    if (!(state->hours == 0 && state->minutes == 0 && state->seconds == 0)) {
+                    if (!(current_slot_state->hours == 0 
+                                && current_slot_state->minutes == 0 
+                                && current_slot_state->seconds == 0)) {
                         // Only start the timer if we have a valid time.
                         start(state, settings);
                         button_beep(settings);
@@ -258,31 +307,43 @@ bool countdown_face_loop(movement_event_t event, movement_settings_t *settings, 
             draw(state, event.subsecond);
             break;
         case EVENT_ALARM_LONG_PRESS:
-            if (state->mode == cd_setting) {
+            if (current_slot_state->mode == cd_setting) {
                 quick_ticks_running = true;
                 movement_request_tick_frequency(8);
             }
             break;
         case EVENT_LIGHT_LONG_PRESS:
-            if (state->mode == cd_setting) {
-                switch (state->selection) {
-                    case 0:
-                        state->hours = 0;
-                        // intentional fallthrough
-                    case 1:
-                        state->minutes = 0;
-                        // intentional fallthrough
-                    case 2:
-                        state->seconds = 0;
-                        break;
-                }
+            switch (current_slot_state->mode) {
+                case cd_setting:
+                    switch (state->selection) {
+                        case 0:
+                            current_slot_state->hours = 0;
+                            // intentional fallthrough
+                        case 1:
+                            current_slot_state->minutes = 0;
+                            // intentional fallthrough
+                        case 2:
+                            current_slot_state->seconds = 0;
+                            break;
+                    }
+                    break;
+                case cd_paused:
+                    reset(state, settings);
+                    button_beep(settings);
+                    break;
+                default:
+                    current_slot_state->mode = cd_setting;
+                    movement_request_tick_frequency(4);
+                    button_beep(settings);
+                    break;
             }
             break;
         case EVENT_ALARM_LONG_UP:
             abort_quick_ticks(state);
             break;
         case EVENT_BACKGROUND_TASK:
-            ring(state);
+            movement_move_to_face(state->watch_face_idx);
+            ring(state, settings);
             break;
         case EVENT_TIMEOUT:
             abort_quick_ticks(state);
@@ -303,9 +364,11 @@ bool countdown_face_loop(movement_event_t event, movement_settings_t *settings, 
 void countdown_face_resign(movement_settings_t *settings, void *context) {
     (void) settings;
     countdown_state_t *state = (countdown_state_t *)context;
-    if (state->mode == cd_setting) {
+    countdown_slot_state_t* current_slot_state = &state->slots[state->current_slot_idx];
+
+    if (current_slot_state->mode == cd_setting) {
         state->selection = 0;
-        state->mode = cd_reset;
+        current_slot_state->mode = cd_reset;
         store_countdown(state);
     }
 }
